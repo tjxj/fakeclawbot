@@ -8,6 +8,7 @@ import logging
 import asyncio
 import time
 import aiohttp
+import re
 from typing import Dict, Optional
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
@@ -369,13 +370,13 @@ async def init_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             try:
                 await processing_msg.edit_text(
-                    f"✅ 项目初始化完成！\n\n{response_text or '已创建 AGENTS.md'}",
+                    f"✅ 项目初始化完成！\n\n{format_telegram_markdown(response_text) or '已创建 AGENTS.md'}",
                     parse_mode=ParseMode.MARKDOWN
                 )
             except Exception as e:
                 logger.warning(f"Telegram Markdown 解析失败，已回退为纯文本: {e}")
                 await processing_msg.edit_text(
-                    f"✅ 项目初始化完成！\n\n{response_text or '已创建 AGENTS.md'}"
+                    f"✅ 项目初始化完成！\n\n{format_telegram_markdown(response_text) or '已创建 AGENTS.md'}"
                 )
             user_session.update_activity()
 
@@ -574,6 +575,20 @@ async def undo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ============ 流式传输辅助 ============
 
 
+def format_telegram_markdown(text: str) -> str:
+    """处理 LLM 返回的 Markdown，使其适配 Telegram Legacy Markdown 格式"""
+    if not text:
+        return text
+    
+    # 替换标题。比如 `# 标题`, `## 小标题` -> `🔸 *标题*`
+    text = re.sub(r'(?m)^#+\s+(.*?)$', r'🔸 *\1*', text)
+    
+    # 转换标准 Markdown 加粗 (**text**) 为 Telegram 式加粗 (*text*)
+    text = re.sub(r'\*\*(.*?)\*\*', r'*\1*', text)
+    
+    return text
+
+
 async def send_message_draft(chat_id: int, draft_id: int, text: str):
     """
     调用 Telegram Bot API 的 sendMessageDraft 方法
@@ -696,9 +711,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         now - last_draft_time >= STREAM_DRAFT_INTERVAL
                         and accumulated_text.strip()
                     ):
+                        formatted_text = format_telegram_markdown(accumulated_text)
                         await send_message_draft(
                             chat_id, draft_id,
-                            accumulated_text + STREAM_CURSOR
+                            formatted_text + STREAM_CURSOR
                         )
                         last_draft_time = now
 
@@ -711,13 +727,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     # 模拟流式输出效果
                     if accumulated_text.strip():
                         await simulate_streaming(
-                            chat_id, draft_id, accumulated_text
+                            chat_id, draft_id, format_telegram_markdown(accumulated_text)
                         )
 
             # ===== 流式结束后发送最后一次 draft（移除光标）=====
             if is_streaming and accumulated_text.strip():
+                formatted_text = format_telegram_markdown(accumulated_text)
                 await send_message_draft(
-                    chat_id, draft_id, accumulated_text
+                    chat_id, draft_id, formatted_text
                 )
                 await asyncio.sleep(0.3)
 
@@ -731,14 +748,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # ===== 发送最终消息（draft 会自动消失）=====
             if not accumulated_text.strip():
                 accumulated_text = "（OpenCode 返回了空回复）"
+                
+            final_text = format_telegram_markdown(accumulated_text)
 
             try:
                 await update.message.reply_text(
-                    accumulated_text, parse_mode=ParseMode.MARKDOWN
+                    final_text, parse_mode=ParseMode.MARKDOWN
                 )
             except Exception as e:
                 logger.warning(f"Telegram Markdown 解析失败，已回退为纯文本: {e}")
-                await update.message.reply_text(accumulated_text)
+                await update.message.reply_text(final_text)
 
             user_session.update_activity()
 
