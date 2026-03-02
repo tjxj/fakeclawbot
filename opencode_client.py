@@ -137,6 +137,113 @@ class OpenCodeClient:
 
         await self._request("POST", f"/session/{session_id}/prompt_async", json=body)
 
+    async def send_message_stream(
+        self,
+        session_id: str,
+        content: str,
+        agent: Optional[str] = None,
+        model: Optional[str] = None,
+    ):
+        """
+        Send a message and yield response chunks as they arrive.
+
+        Tries SSE (text/event-stream) first for true streaming.
+        Falls back to complete JSON response if the server doesn't support SSE.
+
+        Yields dicts:
+          {"type": "chunk", "text": "partial text"}   — SSE streaming
+          {"type": "complete", "result": {...}}        — full JSON response
+        """
+        if not self.session:
+            raise Exception("Client not initialized. Use async with context.")
+
+        body: Dict[str, Any] = {
+            "parts": [{"type": "text", "text": content}],
+        }
+        if agent:
+            body["agent"] = agent
+        if model:
+            provider_id, model_id = model.split("/", 1) if "/" in model else (model, model)
+            body["model"] = {"providerID": provider_id, "modelID": model_id}
+
+        url = f"{self.base_url}/session/{session_id}/message"
+
+        try:
+            async with self.session.post(
+                url,
+                json=body,
+                auth=self.auth,
+                timeout=aiohttp.ClientTimeout(total=None),
+            ) as response:
+                if response.status >= 400:
+                    text = await response.text()
+                    raise Exception(f"HTTP {response.status}: {text}")
+
+                content_type = response.headers.get("Content-Type", "")
+
+                if "text/event-stream" in content_type:
+                    # SSE streaming mode
+                    buffer = ""
+                    async for raw_chunk in response.content.iter_any():
+                        buffer += raw_chunk.decode("utf-8", errors="replace")
+                        while "\n" in buffer:
+                            line, buffer = buffer.split("\n", 1)
+                            line = line.strip()
+                            if not line:
+                                continue
+                            if line.startswith("data:"):
+                                data = line[5:].strip()
+                                if data == "[DONE]":
+                                    return
+                                try:
+                                    parsed = json.loads(data)
+                                    # Try common SSE chunk formats
+                                    chunk_text = ""
+                                    if isinstance(parsed, dict):
+                                        # OpenAI-style: choices[0].delta.content
+                                        choices = parsed.get("choices", [])
+                                        if choices:
+                                            delta = choices[0].get("delta", {})
+                                            chunk_text = delta.get("content", "")
+                                        # OpenCode-style: parts[0].content / text
+                                        if not chunk_text:
+                                            parts = parsed.get("parts", [])
+                                            for part in parts:
+                                                if part.get("type") == "text":
+                                                    chunk_text += (
+                                                        part.get("content")
+                                                        or part.get("text")
+                                                        or ""
+                                                    )
+                                        # Simple text field
+                                        if not chunk_text:
+                                            chunk_text = parsed.get("text", "")
+                                    if chunk_text:
+                                        yield {"type": "chunk", "text": chunk_text}
+                                except json.JSONDecodeError:
+                                    if data:
+                                        yield {"type": "chunk", "text": data}
+                else:
+                    # Standard JSON response (non-streaming)
+                    if "application/json" in content_type:
+                        result = await response.json()
+                    else:
+                        raw = await response.text()
+                        try:
+                            result = json.loads(raw)
+                        except json.JSONDecodeError:
+                            result = {
+                                "parts": [{"type": "text", "content": raw}]
+                            }
+                    yield {"type": "complete", "result": result}
+
+        except asyncio.TimeoutError:
+            raise Exception("Stream request timed out")
+        except Exception as e:
+            if "Stream request" in str(e) or "HTTP" in str(e):
+                raise
+            raise Exception(f"Stream request failed: {str(e)}")
+
     async def list_messages(
         self, session_id: str, limit: Optional[int] = None
     ) -> List[Dict[str, Any]]:

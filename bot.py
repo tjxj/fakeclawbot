@@ -6,6 +6,8 @@ OpenCode Telegram Bot
 import os
 import logging
 import asyncio
+import time
+import aiohttp
 from typing import Dict, Optional
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
@@ -38,6 +40,12 @@ OPENCODE_SERVER_URL = os.getenv("OPENCODE_SERVER_URL", "http://127.0.0.1:4096")
 OPENCODE_USERNAME = os.getenv("OPENCODE_USERNAME")
 OPENCODE_PASSWORD = os.getenv("OPENCODE_PASSWORD")
 MAX_MESSAGE_LENGTH = int(os.getenv("MAX_MESSAGE_LENGTH", "4000"))
+
+# 流式传输配置
+STREAM_DRAFT_INTERVAL = 0.5       # sendMessageDraft 更新间隔（秒）
+SIMULATED_CHUNK_SIZE = 8          # 模拟流式输出时每次发送的词数
+SIMULATED_CHUNK_DELAY = 0.05      # 模拟流式输出每次的间隔（秒）
+STREAM_CURSOR = " ▌"              # 流式显示时的光标符号
 
 # Telegram Markdown 格式系统指令
 # 注入到每条用户消息前，确保 OpenCode 返回的内容符合 Telegram 解析要求
@@ -563,11 +571,86 @@ async def undo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ 撤销失败: {str(e)}")
 
 
+# ============ 流式传输辅助 ============
+
+
+async def send_message_draft(chat_id: int, draft_id: int, text: str):
+    """
+    调用 Telegram Bot API 的 sendMessageDraft 方法
+    实现实时流式消息预览（Bot API 9.5）
+    """
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessageDraft"
+    payload = {
+        "chat_id": chat_id,
+        "draft_id": draft_id,
+        "text": text[:4096],  # Telegram 限制
+    }
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                url, json=payload, timeout=aiohttp.ClientTimeout(total=10)
+            ) as resp:
+                result = await resp.json()
+                if not result.get("ok"):
+                    logger.debug(f"sendMessageDraft response: {result}")
+                return result
+    except Exception as e:
+        logger.debug(f"sendMessageDraft error: {e}")
+        return None
+
+
+async def simulate_streaming(
+    chat_id: int, draft_id: int, text: str
+):
+    """
+    对已得到完整响应的文本，模拟逐步流式输出效果。
+    将文本按词拆分，逐步通过 sendMessageDraft 展示。
+    """
+    words = text.split(" ")
+    total_words = len(words)
+    if total_words <= SIMULATED_CHUNK_SIZE:
+        # 文本太短无需模拟流式
+        await send_message_draft(chat_id, draft_id, text + STREAM_CURSOR)
+        await asyncio.sleep(0.2)
+        return
+
+    sent_count = 0
+    while sent_count < total_words:
+        sent_count = min(sent_count + SIMULATED_CHUNK_SIZE, total_words)
+        partial = " ".join(words[:sent_count])
+        cursor = STREAM_CURSOR if sent_count < total_words else ""
+        await send_message_draft(chat_id, draft_id, partial + cursor)
+        if sent_count < total_words:
+            await asyncio.sleep(SIMULATED_CHUNK_DELAY)
+
+
+def extract_response_text(result: dict) -> str:
+    """从 OpenCode 响应结果中提取文本内容"""
+    parts = result.get("parts", [])
+    info = result.get("info", {})
+    error = info.get("error")
+
+    response_text = ""
+    for part in parts:
+        if part.get("type") == "text":
+            response_text += part.get("content") or part.get("text") or ""
+
+    if not response_text.strip() and error:
+        error_msg = (
+            error.get("data", {}).get("message")
+            or error.get("message")
+            or str(error)
+        )
+        response_text = f"❌ OpenCode Server 错误:\n{error_msg}"
+
+    return response_text
+
+
 # ============ 消息处理 ============
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """处理普通消息"""
+    """处理普通消息 - 支持 sendMessageDraft 实时流式传输"""
     user_id = update.effective_user.id
     text = update.message.text
 
@@ -580,59 +663,91 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # 发送正在输入的提示
-    processing_msg = await update.message.reply_text("🤔 正在思考中...")
+    chat_id = update.effective_chat.id
+    # 生成唯一 draft_id（同一 draft_id 的更新会有动画过渡效果）
+    draft_id = abs(hash(f"{chat_id}_{time.time()}")) % (2**31 - 1) or 1
+
+    # 发送 typing 状态
+    try:
+        await context.bot.send_chat_action(chat_id=chat_id, action="typing")
+    except Exception:
+        pass
+
+    accumulated_text = ""
+    is_streaming = False
+    last_draft_time = 0.0
 
     try:
         async with await get_opencode_client() as client:
-            # 使用默认模型 siliconflow/Pro/moonshotai/Kimi-K2.5
             model = user_session.selected_model or "siliconflow/Pro/moonshotai/Kimi-K2.5"
-            result = await client.send_message(
+
+            async for event in client.send_message_stream(
                 session_id=user_session.opencode_session_id,
                 content=TELEGRAM_FORMAT_INSTRUCTION + text,
                 model=model,
-            )
+            ):
+                if event["type"] == "chunk":
+                    # ===== 真正的 SSE 流式模式 =====
+                    is_streaming = True
+                    accumulated_text += event["text"]
 
-            # 提取回复内容
-            parts = result.get("parts", [])
-            logger.info(f"OpenCode Result: {result}")
-            info = result.get("info", {})
-            error = info.get("error")
+                    now = time.monotonic()
+                    if (
+                        now - last_draft_time >= STREAM_DRAFT_INTERVAL
+                        and accumulated_text.strip()
+                    ):
+                        await send_message_draft(
+                            chat_id, draft_id,
+                            accumulated_text + STREAM_CURSOR
+                        )
+                        last_draft_time = now
 
-            response_text = ""
-            for part in parts:
-                if part.get("type") == "text":
-                    response_text += part.get("content") or part.get("text") or ""
+                elif event["type"] == "complete":
+                    # ===== 非流式模式：一次性获得完整响应 =====
+                    result = event["result"]
+                    logger.info(f"OpenCode Result (non-stream): {result}")
+                    accumulated_text = extract_response_text(result)
 
-            if not response_text.strip() and error:
-                error_msg = (
-                    error.get("data", {}).get("message")
-                    or error.get("message")
-                    or str(error)
+                    # 模拟流式输出效果
+                    if accumulated_text.strip():
+                        await simulate_streaming(
+                            chat_id, draft_id, accumulated_text
+                        )
+
+            # ===== 流式结束后发送最后一次 draft（移除光标）=====
+            if is_streaming and accumulated_text.strip():
+                await send_message_draft(
+                    chat_id, draft_id, accumulated_text
                 )
-                response_text = f"❌ OpenCode Server 错误:\n{error_msg}"
+                await asyncio.sleep(0.3)
 
-            # 截断过长的消息
-            if len(response_text) > MAX_MESSAGE_LENGTH:
-                response_text = (
-                    response_text[: MAX_MESSAGE_LENGTH - 100]
+            # ===== 截断过长消息 =====
+            if len(accumulated_text) > MAX_MESSAGE_LENGTH:
+                accumulated_text = (
+                    accumulated_text[: MAX_MESSAGE_LENGTH - 100]
                     + "\n\n...(消息过长，已截断)"
                 )
 
-            # 如果消息为空，显示提示
-            if not response_text.strip():
-                response_text = "（OpenCode 返回了空回复）"
+            # ===== 发送最终消息（draft 会自动消失）=====
+            if not accumulated_text.strip():
+                accumulated_text = "（OpenCode 返回了空回复）"
 
             try:
-                await processing_msg.edit_text(response_text, parse_mode=ParseMode.MARKDOWN)
+                await update.message.reply_text(
+                    accumulated_text, parse_mode=ParseMode.MARKDOWN
+                )
             except Exception as e:
                 logger.warning(f"Telegram Markdown 解析失败，已回退为纯文本: {e}")
-                await processing_msg.edit_text(response_text)
+                await update.message.reply_text(accumulated_text)
+
             user_session.update_activity()
 
     except Exception as e:
         logger.error(f"发送消息失败: {e}")
-        await processing_msg.edit_text(f"❌ 处理消息时出错: {str(e)}")
+        try:
+            await update.message.reply_text(f"❌ 处理消息时出错: {str(e)}")
+        except Exception:
+            pass
 
 
 # ============ 主程序 ============
